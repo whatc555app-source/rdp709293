@@ -1,0 +1,136 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Set session time limits to "never" (0 = unlimited) via policy registry keys
+          $tsPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          if (-not (Test-Path $tsPolicyPath)) {
+              New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT' -Name 'Terminal Services' -Force | Out-Null
+          }
+          # 0 = unlimited/never
+          New-ItemProperty -Path $tsPolicyPath -Name "MaxIdleTime" -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $tsPolicyPath -Name "MaxDisconnectionTime" -Value 0 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -Path $tsPolicyPath -Name "MaxConnectionTime" -Value 0 -PropertyType DWord -Force | Out-Null
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # Allow incoming connections on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create local user AS with fixed password as.405060
+        run: |
+          $username = "AS"
+          $passwordPlain = "as.405060"
+
+          try {
+              $securePass = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+
+              if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+                  Write-Host "User '$username' already exists. Attempting to update password..."
+                  # Update password (may fail if policy rejects)
+                  $existing = Get-LocalUser -Name $username
+                  $existing | Set-LocalUser -Password $securePass
+              } else {
+                  Write-Host "Creating user '$username' with requested password..."
+                  New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+              }
+
+              # Add to groups (silently continue if already member)
+              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+              # Export credentials to environment for later steps (will appear in workflow logs/env)
+              echo "RDP_CREDS=User: $username | Password: $passwordPlain" >> $env:GITHUB_ENV
+
+              # Verify creation
+              if (-not (Get-LocalUser -Name $username)) {
+                  Write-Error "User creation failed unexpectedly."
+                  exit 1
+              }
+
+              Write-Host "User '$username' created/updated successfully with the requested password."
+          } catch [Microsoft.PowerShell.Commands.InvalidPasswordException] {
+              Write-Error "The requested password '$passwordPlain' was rejected by the system password policy (InvalidPasswordException)."
+              Write-Error "للمتابعة: اضبط سياسة كلمات المرور على النظام لتسمح بهذه البنية، أو اختر كلمة مرور متوافقة."
+              exit 1
+          } catch {
+              Write-Error "Unexpected error while creating/updating user: $_"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: AS"
+          Write-Host "Password: as.405060"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
